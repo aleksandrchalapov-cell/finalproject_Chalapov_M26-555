@@ -7,7 +7,9 @@ authors = [
     { name = "Aleksandr Chalapov", email = "268932756+aleksandrchalapov-cell@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "prettytable>=3.18.0",
+]
 
 [project.scripts]
 valutatrade = "valutatrade_hub.cli.interface:main"
