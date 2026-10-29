@@ -7,6 +7,9 @@ from datetime import datetime
 
 from valutatrade_hub.core.utils import (
     AMOUNT_PRECISION,
+    BASE_CURRENCY,
+    EXCHANGE_RATES,
+    cross_rate,
     format_amount,
     validate_amount,
     validate_currency_code,
@@ -174,3 +177,72 @@ class Wallet:
     def to_dict(self) -> dict:
         """Return the wallet as a portfolios.json record."""
         return {"balance": self._balance}
+
+
+class Portfolio:
+    """All wallets of one user, keyed by currency code."""
+
+    def __init__(self, user: User, wallets: dict[str, Wallet] | None = None) -> None:
+        """Create a portfolio of the user with the given wallets."""
+        self._user = user
+        self._user_id = user.user_id
+        self._wallets = dict(wallets) if wallets else {}
+
+    @classmethod
+    def from_dict(cls, user: User, data: dict) -> "Portfolio":
+        """Restore the portfolio of the user from a portfolios.json record."""
+        wallets = {
+            code: Wallet(code, record["balance"])
+            for code, record in data.get("wallets", {}).items()
+        }
+        return cls(user, wallets)
+
+    @property
+    def user(self) -> User:
+        """Return the owner of the portfolio; it cannot be replaced."""
+        return self._user
+
+    @property
+    def user_id(self) -> int:
+        """Return the identifier of the owner."""
+        return self._user_id
+
+    @property
+    def wallets(self) -> dict[str, Wallet]:
+        """Return a copy of the wallets dictionary."""
+        return dict(self._wallets)
+
+    def add_currency(self, currency_code: str) -> Wallet:
+        """Create an empty wallet for a new currency and return it."""
+        code = validate_currency_code(currency_code)
+        if code in self._wallets:
+            raise ValueError(f"Кошелёк '{code}' уже есть в портфеле")
+        wallet = Wallet(code)
+        self._wallets[code] = wallet
+        return wallet
+
+    def get_wallet(self, currency_code: str) -> Wallet | None:
+        """Return the wallet of the currency, or None if there is no such wallet."""
+        return self._wallets.get(validate_currency_code(currency_code))
+
+    def get_total_value(
+        self,
+        base_currency: str = BASE_CURRENCY,
+        rates: dict[str, float] | None = None,
+    ) -> float:
+        """Return the value of all wallets in the base currency.
+
+        ``rates`` maps currency codes to the price of one unit in USD;
+        without it the fixed stub rates are used.
+        """
+        usd_rates = EXCHANGE_RATES if rates is None else rates
+        base = validate_currency_code(base_currency)
+        total = 0.0
+        for code, wallet in self._wallets.items():
+            total += wallet.balance * cross_rate(code, base, usd_rates)
+        return total
+
+    def to_dict(self) -> dict:
+        """Return the portfolio as a portfolios.json record."""
+        wallets = {code: wallet.to_dict() for code, wallet in self._wallets.items()}
+        return {"user_id": self._user_id, "wallets": wallets}
