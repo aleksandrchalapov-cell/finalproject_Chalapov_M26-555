@@ -1,8 +1,16 @@
 """Domain models of ValutaTrade Hub: users, wallets and portfolios."""
 
 import hashlib
+import math
 import secrets
 from datetime import datetime
+
+from valutatrade_hub.core.utils import (
+    AMOUNT_PRECISION,
+    format_amount,
+    validate_amount,
+    validate_currency_code,
+)
 
 MIN_PASSWORD_LENGTH = 4
 SALT_BYTES = 8
@@ -39,7 +47,7 @@ class User:
 
     @classmethod
     def from_dict(cls, data: dict) -> "User":
-        """Restore a user from users.json"""
+        """Restore a user from a users.json record."""
         return cls(
             user_id=data["user_id"],
             username=data["username"],
@@ -50,7 +58,7 @@ class User:
 
     @property
     def user_id(self) -> int:
-        """return the unique user identifier."""
+        """Return the unique user identifier."""
         return self._user_id
 
     @property
@@ -60,7 +68,7 @@ class User:
 
     @username.setter
     def username(self, value: str) -> None:
-        """Set the user name: it must not be empty."""
+        """Set the user name; it must not be empty."""
         if not isinstance(value, str) or not value.strip():
             raise ValueError("Имя не может быть пустым")
         self._username = value.strip()
@@ -72,7 +80,7 @@ class User:
 
     @property
     def salt(self) -> str:
-        """Return the salt of the password hash"""
+        """Return the salt of the password hash."""
         return self._salt
 
     @property
@@ -86,7 +94,7 @@ class User:
         return hashlib.sha256((password + salt).encode("utf-8")).hexdigest()
 
     def change_password(self, new_password: str) -> None:
-        """Set a new password: check its length, renew the salt, store the hash"""
+        """Set a new password: check its length, renew the salt, store the hash."""
         if not isinstance(new_password, str) or len(new_password) < MIN_PASSWORD_LENGTH:
             raise ValueError(
                 f"Пароль должен быть не короче {MIN_PASSWORD_LENGTH} символов"
@@ -116,3 +124,53 @@ class User:
             "salt": self._salt,
             "registration_date": self._registration_date.isoformat(timespec="seconds"),
         }
+
+
+class Wallet:
+    """A balance in one currency."""
+
+    def __init__(self, currency_code: str, balance: float = 0.0) -> None:
+        """Create a wallet for a currency with a starting balance."""
+        self.currency_code = validate_currency_code(currency_code)
+        self.balance = balance
+
+    @property
+    def balance(self) -> float:
+        """Return the current balance."""
+        return self._balance
+
+    @balance.setter
+    def balance(self, value: float) -> None:
+        """Set the balance: a non-negative number, rounded to 8 decimals."""
+        is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not is_number or not math.isfinite(value):
+            raise ValueError("Баланс должен быть числом")
+        if value < 0:
+            raise ValueError("Баланс не может быть отрицательным")
+        self._balance = round(float(value), AMOUNT_PRECISION)
+
+    def deposit(self, amount: float) -> None:
+        """Add a positive amount to the balance."""
+        self.balance = self._balance + validate_amount(amount)
+
+    def withdraw(self, amount: float) -> None:
+        """Take a positive amount from the balance if there is enough."""
+        amount = validate_amount(amount)
+        if amount > self._balance:
+            code = self.currency_code
+            available = format_amount(code, self._balance)
+            required = format_amount(code, amount)
+            raise ValueError(
+                f"Недостаточно средств: доступно {available} {code}, "
+                f"требуется {required} {code}"
+            )
+        self.balance = self._balance - amount
+
+    def get_balance_info(self) -> str:
+        """Return the balance as text: BTC: 0.0500."""
+        code = self.currency_code
+        return f"{code}: {format_amount(code, self._balance)}"
+
+    def to_dict(self) -> dict:
+        """Return the wallet as a portfolios.json record."""
+        return {"balance": self._balance}
