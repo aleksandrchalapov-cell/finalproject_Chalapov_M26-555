@@ -1,18 +1,14 @@
-"""Helpers of ValutaTrade Hub: JSON storage, input checks, rates and formats."""
+"""Helpers of ValutaTrade Hub: input checks, rates, formats and a cache."""
 
-import json
 import math
+import time
+from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
-from pathlib import Path
+from typing import Any
 
-DATA_DIR = Path("data")
-USERS_FILE = DATA_DIR / "users.json"
-PORTFOLIOS_FILE = DATA_DIR / "portfolios.json"
-RATES_FILE = DATA_DIR / "rates.json"
-JSON_INDENT = 2
+from valutatrade_hub.core.currencies import get_currency
 
 BASE_CURRENCY = "USD"
-RATES_TTL_SECONDS = 300
 STUB_SOURCE = "Stub"
 # Stub rates until the Parser Service exists: the price of one unit in USD.
 EXCHANGE_RATES = {
@@ -24,13 +20,8 @@ EXCHANGE_RATES = {
     "ETH": 3720.00,
     "SOL": 145.12,
 }
-CRYPTO_CODES = frozenset({"BTC", "ETH", "SOL"})
 
-CODE_MIN_LENGTH = 2
-CODE_MAX_LENGTH = 5
 AMOUNT_PRECISION = 8
-FIAT_DECIMALS = 2
-CRYPTO_DECIMALS = 4
 RATE_DECIMALS = 2
 RATE_SIGNIFICANT_DIGITS = 4
 DISPLAY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -38,31 +29,9 @@ ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 AMOUNT_ERROR = "'amount' должен быть положительным числом"
 
 
-def load_json(path: Path, default):
-    """Return the data from a JSON file, or the default if there is no file."""
-    if not path.exists():
-        return default
-    with path.open(encoding="utf-8") as file:
-        return json.load(file)
-
-
-def save_json(path: Path, data) -> None:
-    """Write data to a JSON file: first to a temporary file, then rename it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=JSON_INDENT)
-        file.write("\n")
-    temporary.replace(path)
-
-
 def validate_currency_code(code: str) -> str:
-    """Return the currency code in upper case or raise ValueError."""
-    normalized = code.strip().upper() if isinstance(code, str) else ""
-    length_ok = CODE_MIN_LENGTH <= len(normalized) <= CODE_MAX_LENGTH
-    if not (length_ok and normalized.isascii() and normalized.isalnum()):
-        raise ValueError(f"Некорректный код валюты '{code}'")
-    return normalized
+    """Return the code of a supported currency or raise CurrencyNotFoundError."""
+    return get_currency(code).code
 
 
 def to_number(value: float | str) -> float | None:
@@ -94,8 +63,8 @@ def cross_rate(from_code: str, to_code: str, usd_rates: dict[str, float]) -> flo
 
 
 def decimals_for(code: str) -> int:
-    """Return how many decimals to show: 4 for crypto, 2 for fiat currencies."""
-    return CRYPTO_DECIMALS if code in CRYPTO_CODES else FIAT_DECIMALS
+    """Return how many decimals to show: 2 for fiat, 4 for crypto currencies."""
+    return get_currency(code).decimals
 
 
 def format_amount(code: str, amount: float) -> str:
@@ -134,3 +103,26 @@ def from_iso(text: str) -> datetime:
 def format_timestamp(moment: datetime) -> str:
     """Format a time in the local zone for the user: 2025-10-09 00:03:22."""
     return moment.astimezone().strftime(DISPLAY_TIME_FORMAT)
+
+
+def create_cacher(ttl_seconds: float) -> Callable:
+    """Return cache_result(key, value_func) that remembers values for ttl_seconds.
+
+    The dictionary lives in the closure, so only cache_result can reach it;
+    cache_result.clear() forgets everything, e.g. when the rates change.
+    """
+    cache: dict[Hashable, tuple[float, Any]] = {}
+
+    def cache_result(key: Hashable, value_func: Callable[[], Any]) -> Any:
+        """Return the remembered value of the key or compute and remember it."""
+        now = time.monotonic()
+        if key in cache:
+            saved_at, value = cache[key]
+            if now - saved_at < ttl_seconds:
+                return value
+        value = value_func()
+        cache[key] = (now, value)
+        return value
+
+    cache_result.clear = cache.clear
+    return cache_result
