@@ -1,6 +1,6 @@
 [project]
 name = "valutatrade-hub"
-version = "0.2.0"
+version = "0.3.0"
 description = "Console platform for tracking and simulating currency trading"
 readme = "README.md"
 authors = [
@@ -34,3 +34,8 @@ exclude = ["venv", ".venv", "dist", "__pycache__"]
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = []
+
+[tool.valutatrade]
+rates_ttl_seconds = 300
+default_base_currency = "USD"
+log_level = "INFO"

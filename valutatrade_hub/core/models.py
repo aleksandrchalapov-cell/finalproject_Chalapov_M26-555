@@ -5,6 +5,7 @@ import math
 import secrets
 from datetime import datetime
 
+from valutatrade_hub.core.exceptions import InsufficientFundsError
 from valutatrade_hub.core.utils import (
     AMOUNT_PRECISION,
     BASE_CURRENCY,
@@ -130,12 +131,17 @@ class User:
 
 
 class Wallet:
-    """A balance in one currency."""
+    """A balance in one currency; the currency of a wallet never changes."""
 
     def __init__(self, currency_code: str, balance: float = 0.0) -> None:
-        """Create a wallet for a currency with a starting balance."""
-        self.currency_code = validate_currency_code(currency_code)
+        """Create a wallet for a supported currency with a starting balance."""
+        self._currency_code = validate_currency_code(currency_code)
         self.balance = balance
+
+    @property
+    def currency_code(self) -> str:
+        """Return the code of the currency; it has no setter."""
+        return self._currency_code
 
     @property
     def balance(self) -> float:
@@ -157,21 +163,18 @@ class Wallet:
         self.balance = self._balance + validate_amount(amount)
 
     def withdraw(self, amount: float) -> None:
-        """Take a positive amount from the balance if there is enough."""
+        """Take a positive amount from the balance or raise InsufficientFundsError."""
         amount = validate_amount(amount)
         if amount > self._balance:
-            code = self.currency_code
+            code = self._currency_code
             available = format_amount(code, self._balance)
             required = format_amount(code, amount)
-            raise ValueError(
-                f"Недостаточно средств: доступно {available} {code}, "
-                f"требуется {required} {code}"
-            )
+            raise InsufficientFundsError(available, required, code)
         self.balance = self._balance - amount
 
     def get_balance_info(self) -> str:
         """Return the balance as text: BTC: 0.0500."""
-        code = self.currency_code
+        code = self._currency_code
         return f"{code}: {format_amount(code, self._balance)}"
 
     def to_dict(self) -> dict:

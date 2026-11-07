@@ -1,36 +1,43 @@
-"""Business operations of ValutaTrade Hub, called by the command-line interface."""
+"""Business operations of ValutaTrade Hub, called by the command-line interface.
+
+The singletons are used here: SettingsLoader gives the lifetime of the rates
+and the default base currency, DatabaseManager reads and writes the JSON files.
+"""
 
 from dataclasses import dataclass
 from datetime import datetime
 
+from valutatrade_hub.core.exceptions import ApiRequestError, CurrencyNotFoundError
 from valutatrade_hub.core.models import Portfolio, User, Wallet
 from valutatrade_hub.core.utils import (
     BASE_CURRENCY,
     EXCHANGE_RATES,
-    PORTFOLIOS_FILE,
-    RATES_FILE,
-    RATES_TTL_SECONDS,
     STUB_SOURCE,
-    USERS_FILE,
+    create_cacher,
     cross_rate,
     from_iso,
-    load_json,
-    save_json,
     to_iso,
     utc_now,
     validate_amount,
     validate_currency_code,
 )
+from valutatrade_hub.decorators import log_action
+from valutatrade_hub.infra.database import DatabaseManager
+from valutatrade_hub.infra.settings import SettingsLoader
 
 PAIR_SEPARATOR = "_"
+# get_rate remembers its quotes for a short time; a refresh of the rates clears them.
+_quote_cache = create_cacher(SettingsLoader().get("quote_cache_seconds"))
 
 
 @dataclass(frozen=True)
 class TradeResult:
-    """The outcome of a purchase or a sale."""
+    """The outcome of a purchase or a sale, valued in the base currency."""
 
+    username: str
     currency_code: str
     amount: float
+    base_currency: str
     rate: float
     balance_before: float
     balance_after: float
@@ -56,24 +63,24 @@ class RateQuote:
     updated_at: datetime
 
 
+@log_action("REGISTER")
 def register(username: str, password: str) -> User:
     """Create a user with an empty portfolio; the name must be free."""
-    users = _load_users()
+    database = DatabaseManager()
     name = username.strip()
-    if _find_user(users, name) is not None:
+    if database.find_user(name) is not None:
         raise ValueError(f"Имя пользователя '{name}' уже занято")
-    user_id = max((user.user_id for user in users), default=0) + 1
-    user = User.create(user_id, name, password)
-    users.append(user)
-    _save_users(users)
-    _save_portfolio(Portfolio(user))
+    user = User.create(database.next_user_id(), name, password)
+    database.add_user(user)
+    database.save_portfolio(Portfolio(user))
     return user
 
 
+@log_action("LOGIN")
 def login(username: str, password: str) -> User:
     """Return the user if the name exists and the password is right."""
     name = username.strip()
-    user = _find_user(_load_users(), name)
+    user = DatabaseManager().find_user(name)
     if user is None:
         raise ValueError(f"Пользователь '{name}' не найден")
     if not user.verify_password(password):
@@ -82,18 +89,16 @@ def login(username: str, password: str) -> User:
 
 
 def get_portfolio_summary(
-    user_id: int, base_currency: str = BASE_CURRENCY
+    user_id: int, base_currency: str | None = None
 ) -> PortfolioSummary:
-    """Value every wallet of the user and the whole portfolio in the base."""
-    try:
-        base = validate_currency_code(base_currency)
-    except ValueError:
-        raise ValueError(f"Неизвестная базовая валюта '{base_currency}'") from None
-    portfolio = _load_portfolio(_get_user(user_id))
+    """Value every wallet of the user and the whole portfolio in the base.
+
+    Without a base currency the default one from the settings is used.
+    """
+    base = _base_currency(base_currency)
+    portfolio = _load_portfolio(user_id)
     wallets = portfolio.wallets
     rates = _usd_rates(_fresh_rates({base, *wallets}))
-    if base not in rates:
-        raise ValueError(f"Неизвестная базовая валюта '{base}'")
     items = tuple(
         (wallet, wallet.balance * cross_rate(code, base, rates))
         for code, wallet in wallets.items()
@@ -101,94 +106,95 @@ def get_portfolio_summary(
     return PortfolioSummary(base, items, portfolio.get_total_value(base, rates))
 
 
+@log_action("BUY", verbose=True)
 def buy(user_id: int, currency_code: str, amount: float | str) -> TradeResult:
     """Buy an amount of a currency; a missing wallet is created first."""
     code = validate_currency_code(currency_code)
     quantity = validate_amount(amount)
-    rate = _rate_to_base(code)
-    portfolio = _load_portfolio(_get_user(user_id))
+    portfolio = _load_portfolio(user_id)
     wallet = portfolio.get_wallet(code) or portfolio.add_currency(code)
     before = wallet.balance
     wallet.deposit(quantity)
-    _save_portfolio(portfolio)
-    return TradeResult(code, quantity, rate, before, wallet.balance, quantity * rate)
+    return _finish_trade(portfolio, wallet, quantity, before)
 
 
+@log_action("SELL", verbose=True)
 def sell(user_id: int, currency_code: str, amount: float | str) -> TradeResult:
-    """Sell an amount of a currency from an existing wallet."""
+    """Sell an amount of a currency; Wallet.withdraw checks the funds."""
     code = validate_currency_code(currency_code)
     quantity = validate_amount(amount)
-    portfolio = _load_portfolio(_get_user(user_id))
+    portfolio = _load_portfolio(user_id)
     wallet = portfolio.get_wallet(code)
     if wallet is None:
         raise ValueError(
             f"У вас нет кошелька '{code}'. "
             "Добавьте валюту: она создаётся автоматически при первой покупке."
         )
-    rate = _rate_to_base(code)
     before = wallet.balance
     wallet.withdraw(quantity)
-    _save_portfolio(portfolio)
-    return TradeResult(code, quantity, rate, before, wallet.balance, quantity * rate)
+    return _finish_trade(portfolio, wallet, quantity, before)
 
 
 def get_rate(from_code: str, to_code: str) -> RateQuote:
-    """Return the rate between two currencies from a fresh cache."""
+    """Return the rate between two currencies and the time of its update."""
     source = validate_currency_code(from_code)
     target = validate_currency_code(to_code)
+    return _quote_cache((source, target), lambda: _quote(source, target))
+
+
+def _base_currency(code: str | None) -> str:
+    """Return the base currency: the given code or the default from the settings."""
+    if code is None:
+        code = SettingsLoader().get("default_base_currency")
+    try:
+        return validate_currency_code(code)
+    except CurrencyNotFoundError as error:
+        raise CurrencyNotFoundError(error.code, "базовая валюта") from None
+
+
+def _load_portfolio(user_id: int) -> Portfolio:
+    """Read the portfolio of the user with the identifier or raise ValueError."""
+    database = DatabaseManager()
+    user = database.get_user(user_id)
+    if user is None:
+        raise ValueError(f"Пользователь с id={user_id} не найден")
+    return database.load_portfolio(user)
+
+
+def _finish_trade(
+    portfolio: Portfolio, wallet: Wallet, amount: float, before: float
+) -> TradeResult:
+    """Value the trade in the base currency, save the portfolio, describe it.
+
+    The rate is taken before saving: without a rate nothing is written.
+    """
+    base = _base_currency(None)
+    code = wallet.currency_code
+    rate = cross_rate(code, base, _usd_rates(_fresh_rates({code, base})))
+    DatabaseManager().save_portfolio(portfolio)
+    return TradeResult(
+        username=portfolio.user.username,
+        currency_code=code,
+        amount=amount,
+        base_currency=base,
+        rate=rate,
+        balance_before=before,
+        balance_after=wallet.balance,
+        value_in_base=amount * rate,
+    )
+
+
+def _quote(source: str, target: str) -> RateQuote:
+    """Build a quote from fresh rates; its time is the older of the two rates."""
     cache = _fresh_rates({source, target})
-    rates = _usd_rates(cache)
-    if source not in rates or target not in rates:
-        raise ValueError(f"Курс {source}→{target} недоступен. Повторите попытку позже.")
     times = [
         from_iso(cache["pairs"][_pair_key(code)]["updated_at"])
         for code in (source, target)
         if code != BASE_CURRENCY
     ]
     updated_at = min(times) if times else utc_now()
-    return RateQuote(source, target, cross_rate(source, target, rates), updated_at)
-
-
-def _load_users() -> list[User]:
-    """Read all users from users.json."""
-    return [User.from_dict(record) for record in load_json(USERS_FILE, [])]
-
-
-def _save_users(users: list[User]) -> None:
-    """Write all users to users.json."""
-    save_json(USERS_FILE, [user.to_dict() for user in users])
-
-
-def _find_user(users: list[User], username: str) -> User | None:
-    """Return the user with the name, or None."""
-    return next((user for user in users if user.username == username), None)
-
-
-def _get_user(user_id: int) -> User:
-    """Return the user with the identifier or raise ValueError."""
-    user = next((user for user in _load_users() if user.user_id == user_id), None)
-    if user is None:
-        raise ValueError(f"Пользователь с id={user_id} не найден")
-    return user
-
-
-def _load_portfolio(user: User) -> Portfolio:
-    """Read the portfolio of the user; a user without a record gets an empty one."""
-    records = load_json(PORTFOLIOS_FILE, [])
-    record = next((item for item in records if item["user_id"] == user.user_id), {})
-    return Portfolio.from_dict(user, record)
-
-
-def _save_portfolio(portfolio: Portfolio) -> None:
-    """Replace the record of the portfolio in portfolios.json."""
-    records = [
-        item
-        for item in load_json(PORTFOLIOS_FILE, [])
-        if item["user_id"] != portfolio.user_id
-    ]
-    records.append(portfolio.to_dict())
-    records.sort(key=lambda item: item["user_id"])
-    save_json(PORTFOLIOS_FILE, records)
+    rate = cross_rate(source, target, _usd_rates(cache))
+    return RateQuote(source, target, rate, updated_at)
 
 
 def _pair_key(code: str) -> str:
@@ -197,18 +203,24 @@ def _pair_key(code: str) -> str:
 
 
 def _is_stale(pair: dict) -> bool:
-    """Return True if the rate is older than the cache lifetime."""
+    """Return True if the rate is older than the lifetime from the settings."""
     age = utc_now() - from_iso(pair["updated_at"])
-    return age.total_seconds() >= RATES_TTL_SECONDS
+    return age.total_seconds() >= SettingsLoader().get("rates_ttl_seconds")
 
 
 def _fresh_rates(codes: set[str]) -> dict:
-    """Return the rates cache; refresh it if a needed rate is missing or stale."""
-    cache = load_json(RATES_FILE, {})
+    """Return the rates cache; refresh it if a needed rate is missing or stale.
+
+    Raise ApiRequestError if a needed rate is still missing after the refresh.
+    """
+    cache = DatabaseManager().load_rates()
     pairs = cache.get("pairs", {})
     keys = [_pair_key(code) for code in codes if code != BASE_CURRENCY]
     if any(key not in pairs or _is_stale(pairs[key]) for key in keys):
         cache = _refresh_rates()
+        missing = sorted(key for key in keys if key not in cache["pairs"])
+        if missing:
+            raise ApiRequestError(f"источник не вернул курс {', '.join(missing)}")
     return cache
 
 
@@ -221,7 +233,8 @@ def _refresh_rates() -> dict:
         if code != BASE_CURRENCY
     }
     cache = {"pairs": pairs, "last_refresh": now}
-    save_json(RATES_FILE, cache)
+    DatabaseManager().save_rates(cache)
+    _quote_cache.clear()
     return cache
 
 
@@ -233,11 +246,3 @@ def _usd_rates(cache: dict) -> dict[str, float]:
         if quote == BASE_CURRENCY:
             rates[code] = pair["rate"]
     return rates
-
-
-def _rate_to_base(code: str) -> float:
-    """Return the price of one unit of the currency in USD or raise ValueError."""
-    rates = _usd_rates(_fresh_rates({code}))
-    if code not in rates:
-        raise ValueError(f"Не удалось получить курс для {code}→{BASE_CURRENCY}")
-    return rates[code]
