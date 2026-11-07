@@ -5,15 +5,24 @@ import shlex
 from prettytable import PrettyTable
 
 from valutatrade_hub.core import usecases
+from valutatrade_hub.core.currencies import all_currencies, supported_codes
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    ValutaTradeError,
+)
 from valutatrade_hub.core.models import User
 from valutatrade_hub.core.usecases import TradeResult
 from valutatrade_hub.core.utils import (
-    BASE_CURRENCY,
     format_amount,
     format_money,
     format_rate,
     format_timestamp,
+    validate_amount,
+    validate_currency_code,
 )
+from valutatrade_hub.decorators import confirm_action
+from valutatrade_hub.logging_config import setup_logging
 
 PROMPT = "> "
 OPTION_PREFIX = "--"
@@ -21,6 +30,7 @@ EXIT_COMMAND = "exit"
 SEPARATOR = "-" * 33
 HELP_HINT = "Введите help, чтобы увидеть команды."
 WELCOME = f"ValutaTrade Hub. {HELP_HINT} Для выхода: {EXIT_COMMAND}."
+RETRY_HINT = "Повторите попытку позже или проверьте подключение к сети."
 COMMANDS = {
     "register": ("register --username <str> --password <str>", "зарегистрироваться"),
     "login": ("login --username <str> --password <str>", "войти в систему"),
@@ -28,6 +38,7 @@ COMMANDS = {
     "buy": ("buy --currency <str> --amount <float>", "купить валюту"),
     "sell": ("sell --currency <str> --amount <float>", "продать валюту"),
     "get-rate": ("get-rate --from <str> --to <str>", "курс одной валюты к другой"),
+    "currencies": ("currencies", "список поддерживаемых валют"),
     "help": ("help [команда]", "список команд или справка по одной"),
     EXIT_COMMAND: (EXIT_COMMAND, "выйти из программы"),
 }
@@ -71,6 +82,7 @@ class CommandLineInterface:
             "buy": self._buy,
             "sell": self._sell,
             "get-rate": self._get_rate,
+            "currencies": self._currencies,
             "help": self._help,
         }
 
@@ -104,7 +116,13 @@ class CommandLineInterface:
             return True
         try:
             handler(args)
-        except ValueError as error:
+        except CurrencyNotFoundError as error:
+            print(error)
+            print(f"Поддерживаемые валюты: {', '.join(supported_codes())}")
+        except ApiRequestError as error:
+            print(error)
+            print(RETRY_HINT)
+        except (ValutaTradeError, ValueError) as error:
             print(error)
         return True
 
@@ -133,8 +151,7 @@ class CommandLineInterface:
         """Handle: show-portfolio [--base <str>]."""
         user = self._require_login()
         options = parse_options(args, optional=("base",))
-        base = options.get("base", BASE_CURRENCY)
-        summary = usecases.get_portfolio_summary(user.user_id, base)
+        summary = usecases.get_portfolio_summary(user.user_id, options.get("base"))
         if not summary.items:
             print(f"Портфель пользователя '{user.username}' пуст. Купите валюту: buy")
             return
@@ -154,21 +171,37 @@ class CommandLineInterface:
         _print_trade("Покупка выполнена", result, "Оценочная стоимость покупки")
 
     def _sell(self, args: list[str]) -> None:
-        """Handle: sell --currency <str> --amount <float>."""
+        """Handle: sell --currency <str> --amount <float>, after a confirmation."""
         user = self._require_login()
         options = parse_options(args, required=("currency", "amount"))
-        result = usecases.sell(user.user_id, options["currency"], options["amount"])
-        _print_trade("Продажа выполнена", result, "Оценочная выручка")
+        code = validate_currency_code(options["currency"])
+        amount = validate_amount(options["amount"])
+        result = _sell_after_confirmation(user.user_id, code, amount)
+        if result is not None:
+            _print_trade("Продажа выполнена", result, "Оценочная выручка")
 
     def _get_rate(self, args: list[str]) -> None:
         """Handle: get-rate --from <str> --to <str>."""
         options = parse_options(args, required=("from", "to"))
-        quote = usecases.get_rate(options["from"], options["to"])
+        source = validate_currency_code(options["from"])
+        target = validate_currency_code(options["to"])
+        try:
+            quote = usecases.get_rate(source, target)
+        except ApiRequestError as error:
+            print(error)
+            print(f"Курс {source}→{target} недоступен. Повторите попытку позже.")
+            return
         pair = f"{quote.from_code}→{quote.to_code}"
         updated = format_timestamp(quote.updated_at)
         print(f"Курс {pair}: {format_rate(quote.rate)} (обновлено: {updated})")
         reverse = f"{quote.to_code}→{quote.from_code}"
         print(f"Обратный курс {reverse}: {format_rate(1 / quote.rate)}")
+
+    def _currencies(self, args: list[str]) -> None:
+        """Handle: currencies; every currency describes itself."""
+        parse_options(args)
+        for currency in all_currencies():
+            print(currency.get_display_info())
 
     def _help(self, args: list[str]) -> None:
         """Handle: help [command]."""
@@ -190,17 +223,25 @@ class CommandLineInterface:
 def _print_trade(title: str, result: TradeResult, value_label: str) -> None:
     """Print the result of a purchase or a sale as in the assignment examples."""
     code = result.currency_code
+    base = result.base_currency
     amount = format_amount(code, result.amount)
     rate = format_rate(result.rate)
-    print(f"{title}: {amount} {code} по курсу {rate} {BASE_CURRENCY}/{code}")
+    print(f"{title}: {amount} {code} по курсу {rate} {base}/{code}")
     print("Изменения в портфеле:")
     before = format_amount(code, result.balance_before)
     after = format_amount(code, result.balance_after)
     print(f"- {code}: было {before} → стало {after}")
-    value = format_money(BASE_CURRENCY, result.value_in_base)
-    print(f"{value_label}: {value} {BASE_CURRENCY}")
+    value = format_money(base, result.value_in_base)
+    print(f"{value_label}: {value} {base}")
+
+
+@confirm_action("продажа валюты")
+def _sell_after_confirmation(user_id: int, code: str, amount: float) -> TradeResult:
+    """Sell when the user answers y; otherwise the decorator returns None."""
+    return usecases.sell(user_id, code, amount)
 
 
 def main() -> None:
-    """Start the console interface."""
+    """Configure logging and start the console interface."""
+    setup_logging()
     CommandLineInterface().run()
