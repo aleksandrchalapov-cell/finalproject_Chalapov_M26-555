@@ -11,6 +11,7 @@ DEFAULTS: dict[str, Any] = {
     "users_file": "users.json",
     "portfolios_file": "portfolios.json",
     "rates_file": "rates.json",
+    "rates_history_file": "exchange_rates.json",
     "rates_ttl_seconds": 300,
     "quote_cache_seconds": 60,
     "default_base_currency": "USD",
