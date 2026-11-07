@@ -41,6 +41,10 @@ COMMANDS = {
     "sell": ("sell --currency <str> --amount <float>", "продать валюту"),
     "get-rate": ("get-rate --from <str> --to <str>", "курс одной валюты к другой"),
     "update-rates": ("update-rates [--source <str>]", "обновить курсы"),
+    "show-rates": (
+        "show-rates [--currency <str>] [--top <int>] [--base <str>]",
+        "показать курсы из кеша",
+    ),
     "currencies": ("currencies", "список поддерживаемых валют"),
     "help": ("help [команда]", "список команд или справка по одной"),
     EXIT_COMMAND: (EXIT_COMMAND, "выйти из программы"),
@@ -86,6 +90,7 @@ class CommandLineInterface:
             "sell": self._sell,
             "get-rate": self._get_rate,
             "update-rates": self._update_rates,
+            "show-rates": self._show_rates,
             "currencies": self._currencies,
             "help": self._help,
         }
@@ -215,6 +220,40 @@ class CommandLineInterface:
         if result.last_refresh is not None:
             refreshed = format_timestamp(from_iso(result.last_refresh))
             print(f"Последнее обновление: {refreshed}")
+
+    def _show_rates(self, args: list[str]) -> None:
+        """Handle: show-rates [--currency <str>] [--top <int>] [--base <str>]."""
+        options = parse_options(args, optional=("currency", "top", "base"))
+        top = None
+        if "top" in options:
+            try:
+                top = int(options["top"])
+            except ValueError:
+                raise ValueError("--top должен быть целым числом") from None
+
+        rows = usecases.get_cached_rates(
+            currency=options.get("currency"),
+            top=top,
+            base_currency=options.get("base"),
+        )
+        if not rows:
+            print("Нет курсов для выбранных фильтров.")
+            return
+
+        table = PrettyTable(["Пара", "Курс", "Обновлено", "Статус"])
+        table.align = "l"
+        for row in rows:
+            table.add_row(
+                [
+                    f"{row.from_code}_{row.to_code}",
+                    format_rate(row.rate),
+                    format_timestamp(row.updated_at),
+                    "устарел" if row.is_stale else "актуален",
+                ]
+            )
+        print(table)
+        if any(row.is_stale for row in rows):
+            print("Чтобы обновить устаревшие курсы, выполните 'update-rates'.")
 
     def _currencies(self, args: list[str]) -> None:
         """Handle: currencies; every currency describes itself."""
