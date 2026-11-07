@@ -1,12 +1,44 @@
 """JSON storage of ValutaTrade Hub behind one DatabaseManager instance."""
 
 import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Self
 
 from valutatrade_hub.core.models import Portfolio, User
 from valutatrade_hub.infra.settings import SettingsLoader
 
 JSON_INDENT = 2
+
+
+def read_json(path: Path, default: Any) -> Any:
+    """Read JSON, using the default when the file does not exist."""
+    try:
+        with path.open(encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return default
+
+
+def write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON to a temporary file and replace the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary as file:
+            json.dump(data, file, ensure_ascii=False, indent=JSON_INDENT)
+            file.write("\n")
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 class DatabaseManager:
@@ -80,19 +112,9 @@ class DatabaseManager:
         self._write("rates_file", cache)
 
     def _read(self, key: str, default: Any) -> Any:
-        """Return the data of a JSON file, or the default if there is no file."""
-        path = SettingsLoader().data_path(key)
-        if not path.exists():
-            return default
-        with path.open(encoding="utf-8") as file:
-            return json.load(file)
+        """Read the JSON file named by a settings key."""
+        return read_json(SettingsLoader().data_path(key), default)
 
     def _write(self, key: str, data: Any) -> None:
-        """Write a JSON file through a temporary file and a rename."""
-        path = SettingsLoader().data_path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=JSON_INDENT)
-            file.write("\n")
-        temporary.replace(path)
+        """Write the JSON file named by a settings key."""
+        write_json_atomic(SettingsLoader().data_path(key), data)
