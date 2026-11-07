@@ -18,11 +18,13 @@ from valutatrade_hub.core.utils import (
     format_money,
     format_rate,
     format_timestamp,
+    from_iso,
     validate_amount,
     validate_currency_code,
 )
 from valutatrade_hub.decorators import confirm_action
 from valutatrade_hub.logging_config import setup_logging
+from valutatrade_hub.parser_service.updater import update_rates
 
 PROMPT = "> "
 OPTION_PREFIX = "--"
@@ -38,6 +40,7 @@ COMMANDS = {
     "buy": ("buy --currency <str> --amount <float>", "купить валюту"),
     "sell": ("sell --currency <str> --amount <float>", "продать валюту"),
     "get-rate": ("get-rate --from <str> --to <str>", "курс одной валюты к другой"),
+    "update-rates": ("update-rates [--source <str>]", "обновить курсы"),
     "currencies": ("currencies", "список поддерживаемых валют"),
     "help": ("help [команда]", "список команд или справка по одной"),
     EXIT_COMMAND: (EXIT_COMMAND, "выйти из программы"),
@@ -82,6 +85,7 @@ class CommandLineInterface:
             "buy": self._buy,
             "sell": self._sell,
             "get-rate": self._get_rate,
+            "update-rates": self._update_rates,
             "currencies": self._currencies,
             "help": self._help,
         }
@@ -124,6 +128,8 @@ class CommandLineInterface:
             print(RETRY_HINT)
         except (ValutaTradeError, ValueError) as error:
             print(error)
+        except OSError as error:
+            print(f"Ошибка доступа к файлам: {error}")
         return True
 
     def _require_login(self) -> User:
@@ -196,6 +202,19 @@ class CommandLineInterface:
         print(f"Курс {pair}: {format_rate(quote.rate)} (обновлено: {updated})")
         reverse = f"{quote.to_code}→{quote.from_code}"
         print(f"Обратный курс {reverse}: {format_rate(1 / quote.rate)}")
+
+    def _update_rates(self, args: list[str]) -> None:
+        """Handle: update-rates [--source <str>]."""
+        options = parse_options(args, optional=("source",))
+        result = update_rates(options.get("source"))
+        if result.errors:
+            print("Обновление завершилось с ошибками.")
+            for error in result.errors:
+                print(f"- {error}")
+        print(f"Обновлено курсов: {result.updated_count}")
+        if result.last_refresh is not None:
+            refreshed = format_timestamp(from_iso(result.last_refresh))
+            print(f"Последнее обновление: {refreshed}")
 
     def _currencies(self, args: list[str]) -> None:
         """Handle: currencies; every currency describes itself."""

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from valutatrade_hub.core.exceptions import ApiRequestError
 from valutatrade_hub.core.utils import utc_now
 from valutatrade_hub.logging_config import PARSER_LOGGER
-from valutatrade_hub.parser_service.api_clients import BaseApiClient
+from valutatrade_hub.parser_service.api_clients import (
+    BaseApiClient,
+    CoinGeckoClient,
+    ExchangeRateApiClient,
+)
+from valutatrade_hub.parser_service.config import ParserConfig
 from valutatrade_hub.parser_service.storage import RateObservation, RatesStorage
 
 LOGGER = logging.getLogger(PARSER_LOGGER)
@@ -73,3 +78,20 @@ class RatesUpdater:
             len(errors),
         )
         return UpdateResult(updated_count, last_refresh, tuple(errors))
+
+
+def update_rates(source: str | None = None) -> UpdateResult:
+    """Run a refresh for all sources or for the selected source."""
+    config = ParserConfig()
+    clients: dict[str, BaseApiClient] = {
+        "coingecko": CoinGeckoClient(config),
+        "exchangerate": ExchangeRateApiClient(config),
+    }
+    if source is None:
+        selected = list(clients.values())
+    else:
+        name = source.strip().lower()
+        if name not in clients:
+            raise ValueError("Выберите источник coingecko или exchangerate")
+        selected = [clients[name]]
+    return RatesUpdater(selected, RatesStorage(config)).run_update()
