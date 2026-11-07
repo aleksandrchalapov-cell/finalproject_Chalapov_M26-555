@@ -17,6 +17,7 @@ DEFAULTS: dict[str, Any] = {
     "default_base_currency": "USD",
     "logs_dir": "logs",
     "actions_log_file": "actions.log",
+    "parser_log_file": "parser.log",
     "log_level": "INFO",
     "log_format": "%(levelname)s %(asctime)s %(message)s",
     "log_date_format": "%Y-%m-%dT%H:%M:%S",
