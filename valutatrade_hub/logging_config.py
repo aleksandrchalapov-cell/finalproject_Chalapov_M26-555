@@ -7,15 +7,14 @@ from pathlib import Path
 from valutatrade_hub.infra.settings import SettingsLoader
 
 ACTIONS_LOGGER = "valutatrade.actions"
+PARSER_LOGGER = "valutatrade.parser"
 
 
 def setup_logging() -> None:
-    """Configure the loggers once at start-up.
-
-    The format is a plain string, "INFO 2025-10-09T12:05:22 BUY user='alice' ...":
-    it reads more easily in a terminal than JSON.
-    """
-    _add_rotating_file(ACTIONS_LOGGER, SettingsLoader().log_path("actions_log_file"))
+    """Send trade and parser events to separate rotating files."""
+    settings = SettingsLoader()
+    _add_rotating_file(ACTIONS_LOGGER, settings.log_path("actions_log_file"))
+    _add_rotating_file(PARSER_LOGGER, settings.log_path("parser_log_file"))
 
 
 def _add_rotating_file(name: str, path: Path) -> None:

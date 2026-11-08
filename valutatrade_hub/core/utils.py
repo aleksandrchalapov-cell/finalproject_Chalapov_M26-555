@@ -106,22 +106,23 @@ def format_timestamp(moment: datetime) -> str:
 
 
 def create_cacher(ttl_seconds: float) -> Callable:
-    """Return cache_result(key, value_func) that remembers values for ttl_seconds.
+    """Remember a value for each key until its TTL or version changes."""
+    cache: dict[Hashable, tuple[float, Hashable | None, Any]] = {}
 
-    The dictionary lives in the closure, so only cache_result can reach it;
-    cache_result.clear() forgets everything, e.g. when the rates change.
-    """
-    cache: dict[Hashable, tuple[float, Any]] = {}
-
-    def cache_result(key: Hashable, value_func: Callable[[], Any]) -> Any:
-        """Return the remembered value of the key or compute and remember it."""
+    def cache_result(
+        key: Hashable,
+        value_func: Callable[[], Any],
+        *,
+        version: Hashable | None = None,
+    ) -> Any:
+        """Return a cached value or compute and store its current version."""
         now = time.monotonic()
         if key in cache:
-            saved_at, value = cache[key]
-            if now - saved_at < ttl_seconds:
+            saved_at, saved_version, value = cache[key]
+            if version == saved_version and now - saved_at < ttl_seconds:
                 return value
         value = value_func()
-        cache[key] = (now, value)
+        cache[key] = (now, version, value)
         return value
 
     cache_result.clear = cache.clear

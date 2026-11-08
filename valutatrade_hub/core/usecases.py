@@ -7,16 +7,19 @@ and the default base currency, DatabaseManager reads and writes the JSON files.
 from dataclasses import dataclass
 from datetime import datetime
 
+from valutatrade_hub.core.currencies import (
+    CryptoCurrency,
+    get_currency,
+    supported_codes,
+)
 from valutatrade_hub.core.exceptions import ApiRequestError, CurrencyNotFoundError
 from valutatrade_hub.core.models import Portfolio, User, Wallet
 from valutatrade_hub.core.utils import (
     BASE_CURRENCY,
-    EXCHANGE_RATES,
     STUB_SOURCE,
     create_cacher,
     cross_rate,
     from_iso,
-    to_iso,
     utc_now,
     validate_amount,
     validate_currency_code,
@@ -24,9 +27,10 @@ from valutatrade_hub.core.utils import (
 from valutatrade_hub.decorators import log_action
 from valutatrade_hub.infra.database import DatabaseManager
 from valutatrade_hub.infra.settings import SettingsLoader
+from valutatrade_hub.parser_service.updater import update_rates
 
 PAIR_SEPARATOR = "_"
-# get_rate remembers its quotes for a short time; a refresh of the rates clears them.
+# Calculated quotes are cached per pair and version of their input rates.
 _quote_cache = create_cacher(SettingsLoader().get("quote_cache_seconds"))
 
 
@@ -61,6 +65,13 @@ class RateQuote:
     to_code: str
     rate: float
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class CachedRate(RateQuote):
+    """A displayed rate with a freshness flag."""
+
+    is_stale: bool
 
 
 @log_action("REGISTER")
@@ -136,10 +147,77 @@ def sell(user_id: int, currency_code: str, amount: float | str) -> TradeResult:
 
 
 def get_rate(from_code: str, to_code: str) -> RateQuote:
-    """Return the rate between two currencies and the time of its update."""
+    """Check the saved rates before reusing a calculated quote."""
     source = validate_currency_code(from_code)
     target = validate_currency_code(to_code)
-    return _quote_cache((source, target), lambda: _quote(source, target))
+    cache = _fresh_rates({source, target})
+    pairs = cache.get("pairs", {})
+    used_pairs = [
+        pairs[_pair_key(code)] for code in (source, target) if code != BASE_CURRENCY
+    ]
+    version = tuple((pair["rate"], pair["updated_at"]) for pair in used_pairs)
+    return _quote_cache(
+        (source, target), lambda: _quote(source, target, cache), version=version
+    )
+
+
+def get_cached_rates(
+    currency: str | None = None,
+    top: int | None = None,
+    base_currency: str | None = None,
+) -> list[CachedRate]:
+    """List saved rates and mark expired quotes without refreshing the cache."""
+    base = _base_currency(base_currency)
+    if top is not None and top <= 0:
+        raise ValueError("--top должен быть больше нуля")
+
+    cache = DatabaseManager().load_rates()
+    supported_pairs = {
+        _pair_key(code) for code in supported_codes() if code != BASE_CURRENCY
+    }
+    pairs = {
+        key: pair
+        for key, pair in cache.get("pairs", {}).items()
+        if key in supported_pairs and pair.get("source") != STUB_SOURCE
+    }
+    if not pairs:
+        raise ValueError(
+            "Локальный кеш курсов пуст. Выполните 'update-rates', "
+            "чтобы загрузить данные."
+        )
+
+    snapshot = {"pairs": pairs}
+    rates = _usd_rates(snapshot)
+    if base not in rates:
+        raise ValueError(f"Курс для базовой валюты '{base}' не найден в кеше.")
+    if currency is None:
+        codes = sorted(code for code in rates if code != base)
+    else:
+        code = currency.strip().upper()
+        if code not in rates:
+            raise ValueError(f"Курс для '{code}' не найден в кеше.")
+        codes = [code]
+
+    if top is not None:
+        codes = [
+            code for code in codes if isinstance(get_currency(code), CryptoCurrency)
+        ]
+        codes.sort(key=lambda code: rates[code], reverse=True)
+        codes = codes[:top]
+
+    rows = []
+    for code in codes:
+        quote = _quote(code, base, snapshot)
+        rows.append(
+            CachedRate(
+                quote.from_code,
+                quote.to_code,
+                quote.rate,
+                quote.updated_at,
+                _is_stale(quote.updated_at),
+            )
+        )
+    return rows
 
 
 def _base_currency(code: str | None) -> str:
@@ -184,9 +262,8 @@ def _finish_trade(
     )
 
 
-def _quote(source: str, target: str) -> RateQuote:
-    """Build a quote from fresh rates; its time is the older of the two rates."""
-    cache = _fresh_rates({source, target})
+def _quote(source: str, target: str, cache: dict) -> RateQuote:
+    """Build a quote from the snapshot using the older input timestamp."""
     times = [
         from_iso(cache["pairs"][_pair_key(code)]["updated_at"])
         for code in (source, target)
@@ -202,39 +279,44 @@ def _pair_key(code: str) -> str:
     return f"{code}{PAIR_SEPARATOR}{BASE_CURRENCY}"
 
 
-def _is_stale(pair: dict) -> bool:
-    """Return True if the rate is older than the lifetime from the settings."""
-    age = utc_now() - from_iso(pair["updated_at"])
+def _is_stale(updated_at: datetime) -> bool:
+    """Return whether the rate's timestamp has reached the configured TTL."""
+    age = utc_now() - updated_at
     return age.total_seconds() >= SettingsLoader().get("rates_ttl_seconds")
 
 
-def _fresh_rates(codes: set[str]) -> dict:
-    """Return the rates cache; refresh it if a needed rate is missing or stale.
-
-    Raise ApiRequestError if a needed rate is still missing after the refresh.
-    """
-    cache = DatabaseManager().load_rates()
+def _rates_to_refresh(cache: dict, keys: list[str]) -> list[str]:
+    """List missing, simulated or expired pairs."""
     pairs = cache.get("pairs", {})
-    keys = [_pair_key(code) for code in codes if code != BASE_CURRENCY]
-    if any(key not in pairs or _is_stale(pairs[key]) for key in keys):
-        cache = _refresh_rates()
-        missing = sorted(key for key in keys if key not in cache["pairs"])
-        if missing:
-            raise ApiRequestError(f"источник не вернул курс {', '.join(missing)}")
-    return cache
+    return [
+        key
+        for key in keys
+        if key not in pairs
+        or pairs[key].get("source") == STUB_SOURCE
+        or _is_stale(from_iso(pairs[key]["updated_at"]))
+    ]
 
 
-def _refresh_rates() -> dict:
-    """Write the stub rates to the cache; the Parser Service replaces this later."""
-    now = to_iso(utc_now())
-    pairs = {
-        _pair_key(code): {"rate": rate, "updated_at": now, "source": STUB_SOURCE}
-        for code, rate in EXCHANGE_RATES.items()
-        if code != BASE_CURRENCY
-    }
-    cache = {"pairs": pairs, "last_refresh": now}
-    DatabaseManager().save_rates(cache)
-    _quote_cache.clear()
+def _fresh_rates(codes: set[str]) -> dict:
+    """Return a cache with all required rates, refreshing once when needed."""
+    database = DatabaseManager()
+    keys = sorted(_pair_key(code) for code in codes if code != BASE_CURRENCY)
+    cache = database.load_rates()
+    if not _rates_to_refresh(cache, keys):
+        return cache
+
+    try:
+        errors = update_rates().errors
+    except ApiRequestError as error:
+        errors = (error.reason,)
+
+    cache = database.load_rates()
+    unavailable = _rates_to_refresh(cache, keys)
+    if unavailable:
+        reason = f"нет свежих курсов для {', '.join(unavailable)}"
+        if errors:
+            reason += f". {'; '.join(errors)}"
+        raise ApiRequestError(f"{reason}. Выполните 'update-rates'")
     return cache
 
 
