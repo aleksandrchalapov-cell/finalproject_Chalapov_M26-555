@@ -1,6 +1,6 @@
 [project]
 name = "valutatrade-hub"
-version = "0.3.0"
+version = "0.4.0"
 description = "Console platform for tracking and simulating currency trading"
 readme = "README.md"
 authors = [
